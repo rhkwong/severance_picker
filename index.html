@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Macro Data Refiner</title>
+
+<style>
+  /* Added embedded @font-face for Apple2-like font (replace the data URL with a real font) */
+  @font-face {
+    font-family: 'Apple2';
+    src: url('data:font/woff;base64,REPLACE_WITH_ACTUAL_BASE64_DATA') format('woff');
+  }
+
+  html, body {
+    margin: 0; 
+    padding: 0; 
+    width: 100%; 
+    height: 100%; 
+    background-color: #000;
+    overflow: hidden; /* No scrollbars */
+    cursor: default;  /* More retro feel (no pointer) */
+    user-select: none; /* Prevent text selection globally */
+  }
+
+  /* Popup for completion message */
+  .completionPopup {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.2); /* Start small (20% of normal) */
+    transition: transform 1s ease-out;
+    padding: 20px;
+    border: 1px solid white;
+    background-color: black;
+    color: white;
+    font-family: 'Apple2', monospace;
+    font-size: 40px;
+    text-align: center;
+    opacity: 1;
+    z-index: 1000;
+    display: none; /* Hidden by default */
+  }
+
+  /* When active, show and scale to 100% */
+  .completionPopup.active {
+    display: block;
+    transform: translate(-50%, -50%) scale(1.0);
+  }
+
+  .number {
+    position: absolute; 
+    color: white;
+    font-family: 'Apple2', monospace; /* Use Apple2 font */
+    font-size: 20px;       /* Base size before scaling */
+    transform-origin: 50% 50%;  /* Scale from the center of the element */
+    user-select: none;          /* Prevent text selection on drag */
+  }
+
+  /* New style for name picker and buttons */
+  .namePicker {
+    width: 250px;
+    height: 140px;
+    background-color: black;
+    color: white;
+    border: 1px solid white;
+    margin-bottom: 10px;
+    font-family: 'Apple2', monospace; /* match the retro font */
+    overflow: auto; /* Ensure scrollbars appear when needed */
+    user-select: text; /* Allow text selection inside the text field */
+  }
+
+  /* WebKit-based browsers (Chrome, Safari) */
+  .namePicker::-webkit-scrollbar {
+    width: 12px;
+  }
+
+  .namePicker::-webkit-scrollbar-track {
+    background: black;
+    border: 1px solid white;
+  }
+
+  .namePicker::-webkit-scrollbar-thumb {
+    background: white;
+    border: 1px solid white;
+  }
+
+  /* Firefox */
+  .namePicker {
+    scrollbar-width: thin;
+    scrollbar-color: white black;
+  }
+
+  .nameButton {
+    background-color: black;
+    color: white;
+    border: 1px solid white;
+    margin: 5px;
+    cursor: pointer;
+    font-family: 'Apple2', monospace;
+    font-size: 8px;
+  }
+  #namePickerContainer {
+    position: absolute;
+    left: 20px;
+    bottom: 20px;
+  }
+
+  /* Center the progress bar at the bottom of the window */
+  #progressContainer {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 100px; /* Adjust as needed */
+    color: white;
+    font-family: 'Apple2', monospace;
+    text-align: center;
+  }
+
+  /* A container for "Up next" text, also bottom-centered */
+  #upNextContainer {
+    position: absolute;
+    left: 85%;
+    transform: translateX(-50%);
+    bottom: 120px; /* just above the progress bar */
+    color: white;
+    font-family: 'Apple2', monospace;
+  }
+
+  #progressBar { transition: width 0.6s linear; } /* Animate width changes over 0.6s */
+</style>
+</head>
+
+<body>
+<script>
+(function() {
+  // Configuration
+  // Track a global progress value (0..100), used by getCurrentProgress()
+  let globalProgress = 0.0;
+
+  const spacingX = 50;
+  const spacingY = 50;
+  const thresholdPx = 200;
+
+  // Reserve some space at the bottom (in pixels) so numbers don't overlap the name picker
+  const bottomMarginForPicker = 180;
+  const availableHeight = window.innerHeight - bottomMarginForPicker;
+
+  // Dynamically compute rows/cols to fill the screen (omitting bottomMarginForPicker)
+  let rows = Math.max(1, Math.floor(availableHeight / spacingY));
+  let cols = Math.max(1, Math.floor(window.innerWidth / spacingX));
+
+  const vanishSpeed = 5;
+
+  // We'll define a "center" for collapsing logic
+  let centerRow = (rows - 1) / 2;
+  let centerCol = (cols - 1) / 2;
+
+  const container = document.body;
+
+  // Missing declaration for "numbers" array
+  const numbers = [];
+
+  // 2D grid for storing items: grid[row][col] = item or null
+  let grid = Array.from({ length: rows }, () => Array(cols).fill(null));
+
+  let isMouseDown = false;
+  let mouseDownX = 0;
+  let mouseDownY = 0;
+  const selectedItems = [];
+
+  // Keep track of highest number of names that have ever been in the text field
+  let maxNamesEver = 0;
+
+  // Create the initial grid
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      createNumber(r, c);
+    }
+  }
+
+  /**
+   * Create a new random number in the given row/col and store it in grid.
+   */
+  function createNumber(row, col, startZeroScale = false) {
+    const digit = String(Math.floor(Math.random() * 10));
+    const div = document.createElement('div');
+    div.className = 'number';
+    div.textContent = digit;
+
+    // Give each number a random default scale between 0.75 and 1.5
+    const defaultScale = (Math.random() * 0.5) + 0.75;
+
+    const item = {
+      el: div,
+      row,
+      col,
+      x: col * spacingX + spacingX / 2,
+      y: row * spacingY + spacingY / 2,
+      // If newly spawned from blank, start at 0 and animate to defaultScale
+      // Otherwise, just start at defaultScale.
+      scale: startZeroScale ? 0 : defaultScale,
+      defaultScale,
+      phaseX: Math.random() * 20 * Math.PI,
+      phaseY: Math.random() * 20 * Math.PI,
+      flying: false,
+      flyProgress: 0,
+      appearing: startZeroScale,
+      appearProgress: startZeroScale ? 0 : 1,
+      appearSpeed: 0.05
+    };
+
+    // If we want a smooth scale-up from 0 -> 1, define a small speed:
+    item.appearSpeed = 0.05;
+
+    numbers.push(item);
+    grid[row][col] = item;
+
+    div.style.left = item.x + 'px';
+    div.style.top = item.y + 'px';
+    div.style.transform = 'translate(-50%, -50%) scale(' + item.scale + ')';
+
+    container.appendChild(div);
+  }
+
+  // Function to handle mouse movement
+  function handleMouseMove(e) {
+    const mouseX = e.clientX;
+    const mouseY = e.clientY;
+
+    for (const item of numbers) {
+      if (item.flying) continue; // Skip scaling logic for flying items
+
+      const dx = mouseX - item.x;
+      const dy = mouseY - item.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      
+      // If mouse is within threshold, compute a scale that can go up to 2
+      // but never below this item's defaultScale:
+      let scale;
+      if (dist < thresholdPx) {
+        // E.g. up to 2 near the mouse, linearly down to 1 at threshold
+        // but we clamp it so it never goes below item.defaultScale
+        const mouseScale = 2 - (dist / thresholdPx);
+        scale = Math.max(mouseScale, item.defaultScale);
+      } else {
+        // If farther than threshold, revert to default scale
+        scale = item.defaultScale;
+      }
+
+      if (!selectedItems.includes(item)) {
+        item.scale = scale;
+      }
+
+      // New: Select items while mouse is down
+      if (isMouseDown) {
+        const itemUnderMouse = findItemUnderMouse(mouseX, mouseY);
+        if (itemUnderMouse && !selectedItems.includes(itemUnderMouse)) {
+          selectedItems.push(itemUnderMouse);
+          itemUnderMouse.scale += 1;  // Make newly selected item bigger
+        }
+      }
+    }
+  }
+
+  // New: Check if the mouse is over a particular number
+  function findItemUnderMouse(mx, my) {
+    // We'll consider "under mouse" if within ~1/2 spacing in each direction:
+    for (const item of numbers) {
+      if (item.flying) continue;
+      // Check distance in pixel space
+      const dx = mx - item.x;
+      const dy = my - item.y;
+      if (Math.abs(dx) < spacingX/2 && Math.abs(dy) < spacingY/2) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  // MouseDown: record start, select any item under mouse
+  function handleMouseDown(e) {
+    isMouseDown = true;
+    mouseDownX = e.clientX;
+    mouseDownY = e.clientY;
+
+    const item = findItemUnderMouse(mouseDownX, mouseDownY);
+    if (item && !selectedItems.includes(item)) {
+      selectedItems.push(item);
+      item.scale += 1;  // Make newly selected item bigger
+    }
+  }
+
+  // MouseUp: bounding rectangle logic, then mark items for flight
+  function handleMouseUp(e) {
+    isMouseDown = false;
+    var numSelected = selectedItems.length;
+    if (numSelected > 0) {
+      // 1) Check if the first and last points are neighbors
+      const firstItem = selectedItems[0];
+      const lastItem = selectedItems[selectedItems.length - 1];
+
+      // Simple function that returns true if distance < some threshold
+      function areNeighbors(a, b, threshold = 75) {
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        return dist <= threshold;
+      }
+
+      if (selectedItems.length > 1 && areNeighbors(firstItem, lastItem)) {
+        // 2) If first/last are neighbors, run the concave hull logic
+        const hull = computeConcaveHull(selectedItems, /*k=*/10);
+
+        // For all other items, do a point-in-polygon test
+        for (const item of numbers) {
+          if (item.flying) continue;
+          if (!selectedItems.includes(item)) {
+            if (isPointInPolygon(item.x, item.y, hull)) {
+              selectedItems.push(item);
+              item.scale += 1;  // example of making newly selected item bigger
+            }
+          }
+        }
+      }
+
+      numSelected = selectedItems.length;
+            // Before we fly items away, figure out how much progress each item should add
+            const oldProgress = getCurrentProgress(); 
+      // e.g. we increase progress by (1.0 / maxNamesEver) * 100
+      const increment = (1.0 / maxNamesEver) * 100; 
+      const finalProgressValue = oldProgress + increment;
+      const totalDelta = Math.max(0, increment);
+
+  
+      let incrementPerItem = 0.0;
+      if (totalDelta > 0) {
+        incrementPerItem = totalDelta / numSelected;
+      }
+
+    
+      console.log(totalDelta);
+      console.log(incrementPerItem);
+      console.log(numSelected);
+
+      // 3) Mark selected items as flying TOWARD the progress bar.
+      //    Each item will increment the progress bar by incrementPerItem when arriving
+      const progressRect = document
+        .getElementById("progressContainer")
+        .getBoundingClientRect();
+      // We'll define a target near the middle of the progress bar:
+      const targetX = progressRect.left + progressRect.width / 2;
+      const targetY = progressRect.top + progressRect.height / 2;
+
+      for (const item of selectedItems) {
+        item.flying = true;
+        item.flyProgress = 0;
+        item.flyStartX = item.x;
+        item.flyStartY = item.y;
+
+        // Store target coordinates in the item object, so we can reference them in animate():
+        item.targetX = targetX;
+        item.targetY = targetY;
+
+        const dx = targetX - item.x;
+        const dy = targetY - item.y;
+        item.flyDistance = Math.sqrt(dx * dx + dy * dy);
+        item.progressIncrement = incrementPerItem;
+
+        // Clear from grid
+        if (grid[item.row][item.col] === item) {
+          grid[item.row][item.col] = null;
+        }
+      }
+
+      selectedItems.length = 0; // reset
+
+      // After a group is selected, handle picking/removing a name, updating progress, etc.
+      handleNameSelection();
+    }
+  }
+
+  /**
+   * A simple KNN-based concave hull approach. This is a conceptual example
+   * and may need optimization for large datasets or edge cases.
+   * @param {Array} items - The items to hull, each having {x, y}
+   * @param {number} k - Number of neighbors to consider
+   * @returns {Array} An array of points (in order) representing a concave boundary
+   */
+  function computeConcaveHull(items, k) {
+    // For consistency, transform items to a simpler array of points { x, y }.
+    const points = items.map(i => ({ x: i.x, y: i.y }));
+    if (points.length < 3) return points;
+
+    // Sort by x, then y
+    points.sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
+
+    const hull = [];
+    const visited = new Set();
+
+    // Start with the leftmost point
+    let current = points[0];
+    hull.push(current);
+    visited.add(current);
+
+    while (true) {
+      const neighbors = findKNearestNeighbors(current, points, k, visited);
+      let next = null;
+
+      for (const neighbor of neighbors) {
+        if (!visited.has(neighbor)) {
+          next = neighbor;
+          break;
+        }
+      }
+
+      if (!next) break; // No new neighbor found
+
+      hull.push(next);
+      visited.add(next);
+      current = next;
+
+      // Stop if we've looped back to the start
+      if (next === hull[0]) break;
+    }
+
+    return hull;
+  }
+
+  function findKNearestNeighbors(point, allPoints, k, visited) {
+    return allPoints
+      .filter(p => !visited.has(p))
+      .sort((a, b) => distance(point, a) - distance(point, b))
+      .slice(0, k);
+  }
+
+  function distance(a, b) {
+    return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+  }
+
+  /**
+   * Ray-casting point-in-polygon check.
+   * polygon is an array of {x,y} in hull order.
+   */
+  function isPointInPolygon(px, py, polygon) {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].x, yi = polygon[i].y;
+      const xj = polygon[j].x, yj = polygon[j].y;
+      // Check edges for crossing
+      const intersect = ((yi > py) !== (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  // Replace old collapse with simpler "fillBlanks" that spawns brand-new items at scale=0.
+  function fillBlanks() {
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (grid[r][c] == null) {
+          createNumber(r, c, /*startZeroScale*/ true);
+        }
+      }
+    }
+  }
+
+  // Animate bobbing and flight
+  let time = 0;
+  function animate() {
+    time += 0.03;
+    const vanishedItems = [];
+
+    for (const item of numbers) {
+      // If item is newly spawned at scale=0, animate it toward its defaultScale
+      if (item.appearing) {
+        item.appearProgress = Math.min(item.appearProgress + item.appearSpeed, 1);
+        // Move from 0 to item.defaultScale
+        item.scale = item.defaultScale * item.appearProgress;
+        if (item.appearProgress >= 1) {
+          item.appearing = false;
+        }
+      }
+
+      if (item.flying && item.flyDistance > 0) {
+        // move at vanishSpeed px/frame
+        const dx = (item.targetX) - item.flyStartX;
+        const dy = (item.targetY) - item.flyStartY;
+
+        const step = vanishSpeed / item.flyDistance; 
+        item.flyProgress = Math.min(item.flyProgress + step, 1);
+        // Lerp positions
+        const newX = item.flyStartX + item.flyProgress * dx;
+        const newY = item.flyStartY + item.flyProgress * dy;
+        item.x = newX;
+        item.y = newY;
+
+        // When item arrives (flyProgress >= 1), increment the progress bar
+        if (item.flyProgress >= 1) {
+          item.flying = false;
+
+          // Add to the progress bar by item.progressIncrement
+          const oldP = getCurrentProgress();
+          let nextP = oldP + item.progressIncrement;
+          console.log(nextP);
+          setProgress(nextP);
+
+          // If there are no more names in the field, force 100%
+          const namePicker = document.getElementById("namePicker");
+          const remainingLines = namePicker.value
+            .split(/[\r\n]+/)
+            .filter(line => line.trim() !== "");
+          if (remainingLines.length === 0) {
+            // No more names => finalize progress at 100%
+            setProgress(100);
+          }
+
+          container.removeChild(item.el);
+          vanishedItems.push(item);
+        }
+      } else {
+        // Always bob, regardless of scale
+        const amplitude = 2 * item.scale;
+        const offsetX = amplitude * Math.sin(time + item.phaseX);
+        const offsetY = amplitude * Math.cos(time + item.phaseY);
+        item.el.style.transform = 
+          `translate(-50%, -50%) translate(${offsetX}px, ${offsetY}px) scale(${item.scale})`;
+      }
+
+      // Update element positions
+      item.el.style.left = item.x + 'px';
+      item.el.style.top = item.y + 'px';
+    }
+
+    if (vanishedItems.length > 0) {
+      fillBlanks(); // After items are removed, fill blanks with new items
+    }
+
+    requestAnimationFrame(animate);
+  }
+
+  // Mouse event listeners
+  window.addEventListener('mousemove', handleMouseMove);
+  window.addEventListener('mousedown', handleMouseDown);
+  window.addEventListener('mouseup', handleMouseUp);
+
+  animate();
+
+  // Create an array of default names
+  const defaultNames = [
+  ].sort();
+
+  // Wait until the DOM is loaded to attach button click listeners
+  window.addEventListener('DOMContentLoaded', () => {
+    const namePicker = document.getElementById('namePicker');
+    const namePickerContainer = document.getElementById('namePickerContainer');
+
+    // Create buttons for each default name
+    defaultNames.forEach(name => {
+      const button = document.createElement('button');
+      button.className = 'nameButton';
+      button.setAttribute('data-name', name);
+      button.textContent = name;
+      button.addEventListener('click', () => {
+        const lines = namePicker.value.split(/[\r\n]+/);
+        if (!lines.includes(name)) {
+          if (namePicker.value.trim() === '') {
+            namePicker.value = name;
+          } else {
+            namePicker.value += '\n' + name;
+          }
+
+          // Update maxNamesEver to reflect new total lines, if needed
+          const updatedLines = namePicker.value
+            .split(/[\r\n]+/)
+            .filter(line => line.trim() !== "");
+          if (updatedLines.length > maxNamesEver) {
+            maxNamesEver = updatedLines.length;
+          }
+          updateProgress(updatedLines.length);
+        }
+      });
+      document.getElementById('nameButtonsWrapper').appendChild(button);
+    });
+
+    // Listen for manual changes to the text field
+    namePicker.addEventListener('input', () => {
+      const lines = namePicker.value.split(/[\r\n]+/).filter(line => line.trim() !== "");
+      if (lines.length > maxNamesEver) {
+        maxNamesEver = lines.length;
+      }
+      updateProgress(lines.length);
+    });
+  });
+
+  /**
+   * Picks a random name from the text field (if present), removes it,
+   * updates the progress bar, and temporarily assigns that name to all numbers.
+   */
+  function handleNameSelection() {
+    const namePicker = document.getElementById("namePicker");
+    if (!namePicker) return;
+
+    // Extract lines from the text field
+    let lines = namePicker.value.split(/[\r\n]+/).filter(line => line.trim() !== "");
+
+    // If no names, do nothing
+    if (lines.length === 0) return;
+
+    // Randomly pick an index
+    const randomIndex = Math.floor(Math.random() * lines.length);
+    const chosenName = lines[randomIndex];
+
+    // Remove that from the text field
+    lines.splice(randomIndex, 1);
+    namePicker.value = lines.join("\n");
+
+    // Instead of changing numbers, show "Up next: chosenName"
+    const upNextElem = document.getElementById('upNextContainer');
+    if (upNextElem) {
+      upNextElem.textContent = "Up next: " + chosenName;
+    }
+  }
+
+  // Helper function to update the progress bar
+  function updateProgress(currentCount) {
+    if (maxNamesEver === 0) return;
+
+    const progressRatio = 1 - (currentCount / maxNamesEver);
+    const percentage = progressRatio * 100;
+    setProgress(percentage);
+
+    // If there are no remaining names, always fill the progress bar
+    if (currentCount === 0) {
+      setProgress(100);
+      return;
+    }
+  }
+
+  /**
+   * Returns the current percentage of the progress bar (integer 0..100).
+   */
+  function getCurrentProgress() {
+    // Return the global variable instead of reading from the DOM
+    return globalProgress;
+  }
+
+  /**
+   * Clamps and sets the global progress, then updates the DOM.
+   */
+  function setProgress(value) {
+    // Clamp to [0, 100] and ensure it's a float
+    globalProgress = Math.max(0, Math.min(100, value));
+    document.getElementById("progressBar").style.width = globalProgress + "%";
+    document.getElementById("progressPercent").textContent = globalProgress.toFixed(2) + "% Complete";
+
+    // Show completion message if progress is 100%
+    const completionMessage = document.getElementById("completionMessage");
+    if (globalProgress === 100) {
+      completionMessage.classList.add('active');
+    } else {
+      completionMessage.classList.remove('active');
+    }
+  }
+
+  // Listen for clicks anywhere on the page. If the completion message is visible, hide it.
+  window.addEventListener('click', () => {
+    const completionMessage = document.getElementById("completionMessage");
+    // If it's in an active (displayed) state, remove .active to hide it
+    if (completionMessage.classList.contains('active')) {
+      completionMessage.classList.remove('active');
+    }
+  });
+})();
+</script>
+
+<!-- Name picker and buttons container -->
+<div id="namePickerContainer" style="display: flex; align-items: flex-start;">
+  <textarea id="namePicker" class="namePicker"></textarea>
+  <div id="nameButtonsWrapper" style="
+    width: 250px; 
+    border: 1px solid white;
+    background-color: black;
+    padding: 5px;
+    display: flex;
+    flex-wrap: wrap;
+    margin-left: 10px; /* Add some space between the text area and buttons */
+  ">
+    <!-- Buttons will be dynamically added here -->
+  </div>
+</div>
+
+<!-- Completion message container -->
+<div id="completionMessage" class="completionPopup">
+  MACRODATA REFINEMENT COMPLETE
+</div>
+
+<!-- Progress bar container -->
+<div id="progressContainer">
+  <div style="position: relative; width: 200px; height: 20px; border: 1px solid white; background: black;">
+    <div id="progressBar" style="
+        position: absolute;
+        height: 100%;
+        width: 0%;
+        background: white;">
+    </div>
+  </div>
+  <div id="progressPercent" style="margin-top: 6px; text-align: center;">0% Complete</div>
+</div>
+
+<!-- Up next container -->
+<div id="upNextContainer">
+  <!-- Will be set to "Up next: [name]" dynamically -->
+</div>
+
+</body>
+</html>
